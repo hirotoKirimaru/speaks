@@ -15,7 +15,15 @@ OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_MODEL = "llama3.1:8b"
 WHISPER_MODEL = "large-v3"
 
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
+def _resolve_hf_token() -> str:
+    """HFトークンを自動解決: 環境変数 → ~/.cache/huggingface/token"""
+    token = os.environ.get("HF_TOKEN", "")
+    if token:
+        return token
+    token_path = Path.home() / ".cache" / "huggingface" / "token"
+    if token_path.exists():
+        return token_path.read_text().strip()
+    return ""
 
 SUMMARY_PROMPT = """以下は会議や雑談の文字起こしです。これを議事録形式にまとめてください。
 
@@ -166,8 +174,8 @@ def main():
     )
     parser.add_argument(
         "--hf-token",
-        default=HF_TOKEN,
-        help="HuggingFace トークン (環境変数 HF_TOKEN でも可)",
+        default=None,
+        help="HuggingFace トークン (省略時は ~/.cache/huggingface/token or HF_TOKEN)",
     )
     parser.add_argument(
         "--output-dir", default="output", help="出力ディレクトリ (default: output)"
@@ -179,9 +187,11 @@ def main():
         print(f"エラー: ファイルが見つかりません: {audio_path}", file=sys.stderr)
         sys.exit(1)
 
-    if not args.no_diarize and not args.hf_token:
+    hf_token = args.hf_token or _resolve_hf_token()
+    if not args.no_diarize and not hf_token:
         print(
             "エラー: 話者分離には HuggingFace トークンが必要です。\n"
+            "  huggingface-cli login でログインするか、\n"
             "  --hf-token <token> または環境変数 HF_TOKEN を設定してください。\n"
             "  話者分離なしで実行するには --no-diarize を指定してください。",
             file=sys.stderr,
@@ -195,7 +205,7 @@ def main():
     # 話者分離
     speaker_turns = None
     if not args.no_diarize:
-        speaker_turns = diarize(str(audio_path), args.hf_token)
+        speaker_turns = diarize(str(audio_path), hf_token)
 
     # 文字起こし
     transcript = transcribe(str(audio_path), args.whisper_model, speaker_turns)
