@@ -1719,13 +1719,14 @@ wheels = [
 [[package]]
 name = "speaks"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "faster-whisper" },
     { name = "httpx" },
     { name = "pyannote-audio" },
     { name = "torch" },
     { name = "torchaudio" },
+    { name = "typer" },
 ]
 
 [package.metadata]
@@ -1735,6 +1736,7 @@ requires-dist = [
     { name = "pyannote-audio", specifier = ">=4.0.4" },
     { name = "torch", specifier = ">=2.11.0" },
     { name = "torchaudio", specifier = ">=2.11.0" },
+    { name = "typer", specifier = ">=0.24.0" },
 ]
 
 [[package]]

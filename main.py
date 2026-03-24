@@ -1,29 +1,21 @@
 """speaks - ローカル音声文字起こし + 議事録要約ツール"""
 
-import argparse
 import os
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Annotated, Optional
 
 import httpx
+import typer
 from faster_whisper import WhisperModel
 
+app = typer.Typer(help="音声ファイルを文字起こし + 議事録要約")
 
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_MODEL = "llama3.1:8b"
 WHISPER_MODEL = "large-v3"
-
-def _resolve_hf_token() -> str:
-    """HFトークンを自動解決: 環境変数 → ~/.cache/huggingface/token"""
-    token = os.environ.get("HF_TOKEN", "")
-    if token:
-        return token
-    token_path = Path.home() / ".cache" / "huggingface" / "token"
-    if token_path.exists():
-        return token_path.read_text().strip()
-    return ""
 
 SUMMARY_PROMPT = """以下は会議や雑談の文字起こしです。これを議事録形式にまとめてください。
 
@@ -51,7 +43,18 @@ SUMMARY_PROMPT = """以下は会議や雑談の文字起こしです。これを
 """
 
 
-def diarize(audio_path: str, hf_token: str) -> list[tuple[float, float, str]]:
+def _resolve_hf_token() -> str:
+    """HFトークンを自動解決: 環境変数 → ~/.cache/huggingface/token"""
+    token = os.environ.get("HF_TOKEN", "")
+    if token:
+        return token
+    token_path = Path.home() / ".cache" / "huggingface" / "token"
+    if token_path.exists():
+        return token_path.read_text().strip()
+    return ""
+
+
+def _diarize(audio_path: str, hf_token: str) -> list[tuple[float, float, str]]:
     """pyannote で話者分離"""
     print("[1/3] 話者分離中...", file=sys.stderr)
     start = time.time()
@@ -73,9 +76,24 @@ def diarize(audio_path: str, hf_token: str) -> list[tuple[float, float, str]]:
     return turns
 
 
-def transcribe(
+def _find_speaker(timestamp: float, turns: list[tuple[float, float, str]]) -> str:
+    """タイムスタンプに対応する話者を返す"""
+    for start, end, speaker in turns:
+        if start <= timestamp <= end:
+            return speaker
+    min_dist = float("inf")
+    closest = "不明"
+    for start, end, speaker in turns:
+        dist = min(abs(timestamp - start), abs(timestamp - end))
+        if dist < min_dist:
+            min_dist = dist
+            closest = speaker
+    return closest
+
+
+def _transcribe(
     audio_path: str,
-    model_size: str = WHISPER_MODEL,
+    model_size: str,
     speaker_turns: list[tuple[float, float, str]] | None = None,
 ) -> str:
     """faster-whisper で音声を文字起こし"""
@@ -99,7 +117,6 @@ def transcribe(
             lines.append(f"[{seg.start:.1f}s - {seg.end:.1f}s] {seg.text}")
         return "\n".join(lines)
 
-    # 話者分離結果とマージ
     lines = []
     for seg in segments:
         seg_mid = (seg.start + seg.end) / 2
@@ -108,28 +125,9 @@ def transcribe(
     return "\n".join(lines)
 
 
-def _find_speaker(
-    timestamp: float, turns: list[tuple[float, float, str]]
-) -> str:
-    """タイムスタンプに対応する話者を返す"""
-    for start, end, speaker in turns:
-        if start <= timestamp <= end:
-            return speaker
-    # 最も近い区間の話者を返す
-    min_dist = float("inf")
-    closest = "不明"
-    for start, end, speaker in turns:
-        dist = min(abs(timestamp - start), abs(timestamp - end))
-        if dist < min_dist:
-            min_dist = dist
-            closest = speaker
-    return closest
-
-
-def summarize(transcript: str, model: str = OLLAMA_MODEL) -> str:
+def _summarize(transcript: str, model: str, step: str = "[3/3]") -> str:
     """Ollama で議事録風に要約"""
-    print("[3/3] 要約中..." if True else "[2/2] 要約中...", file=sys.stderr)
-    print(f"  (model: {model})", file=sys.stderr)
+    print(f"{step} 要約中... (model: {model})", file=sys.stderr)
     start = time.time()
 
     prompt = SUMMARY_PROMPT.format(transcript=transcript)
@@ -147,80 +145,52 @@ def summarize(transcript: str, model: str = OLLAMA_MODEL) -> str:
     return result
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="音声ファイルを文字起こし + 議事録要約"
-    )
-    parser.add_argument("audio", help="入力WAVファイルのパス")
-    parser.add_argument(
-        "--whisper-model",
-        default=WHISPER_MODEL,
-        help=f"Whisperモデル (default: {WHISPER_MODEL})",
-    )
-    parser.add_argument(
-        "--ollama-model",
-        default=OLLAMA_MODEL,
-        help=f"Ollamaモデル (default: {OLLAMA_MODEL})",
-    )
-    parser.add_argument(
-        "--transcript-only",
-        action="store_true",
-        help="文字起こしのみ（要約なし）",
-    )
-    parser.add_argument(
-        "--no-diarize",
-        action="store_true",
-        help="話者分離を無効化",
-    )
-    parser.add_argument(
-        "--hf-token",
-        default=None,
-        help="HuggingFace トークン (省略時は ~/.cache/huggingface/token or HF_TOKEN)",
-    )
-    parser.add_argument(
-        "--output-dir", default="output", help="出力ディレクトリ (default: output)"
-    )
-    args = parser.parse_args()
+@app.command()
+def run(
+    audio: Annotated[Path, typer.Argument(help="入力WAVファイルのパス")],
+    whisper_model: Annotated[str, typer.Option(help="Whisperモデル")] = WHISPER_MODEL,
+    ollama_model: Annotated[str, typer.Option(help="Ollamaモデル")] = OLLAMA_MODEL,
+    transcript_only: Annotated[bool, typer.Option("--transcript-only", help="文字起こしのみ")] = False,
+    no_diarize: Annotated[bool, typer.Option("--no-diarize", help="話者分離を無効化")] = False,
+    hf_token: Annotated[Optional[str], typer.Option(help="HuggingFaceトークン")] = None,
+    output_dir: Annotated[Path, typer.Option(help="出力ディレクトリ")] = Path("output"),
+):
+    """音声ファイルを文字起こしして議事録を生成する。"""
+    if not audio.exists():
+        typer.echo(f"エラー: ファイルが見つかりません: {audio}", err=True)
+        raise typer.Exit(1)
 
-    audio_path = Path(args.audio)
-    if not audio_path.exists():
-        print(f"エラー: ファイルが見つかりません: {audio_path}", file=sys.stderr)
-        sys.exit(1)
-
-    hf_token = args.hf_token or _resolve_hf_token()
-    if not args.no_diarize and not hf_token:
-        print(
+    token = hf_token or _resolve_hf_token()
+    if not no_diarize and not token:
+        typer.echo(
             "エラー: 話者分離には HuggingFace トークンが必要です。\n"
             "  huggingface-cli login でログインするか、\n"
             "  --hf-token <token> または環境変数 HF_TOKEN を設定してください。\n"
             "  話者分離なしで実行するには --no-diarize を指定してください。",
-            file=sys.stderr,
+            err=True,
         )
-        sys.exit(1)
+        raise typer.Exit(1)
 
-    output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     prefix = datetime.now().strftime("%Y-%m-%d_%H%M%S")
 
-    # 話者分離
     speaker_turns = None
-    if not args.no_diarize:
-        speaker_turns = diarize(str(audio_path), hf_token)
+    if not no_diarize:
+        speaker_turns = _diarize(str(audio), token)
 
-    # 文字起こし
-    transcript = transcribe(str(audio_path), args.whisper_model, speaker_turns)
+    transcript = _transcribe(str(audio), whisper_model, speaker_turns)
 
     transcript_path = output_dir / f"{prefix}_transcript.txt"
     transcript_path.write_text(transcript, encoding="utf-8")
-    print(f"  → {transcript_path}", file=sys.stderr)
+    typer.echo(f"  → {transcript_path}", err=True)
 
-    # 要約
-    if not args.transcript_only:
-        summary = summarize(transcript, args.ollama_model)
+    if not transcript_only:
+        step = "[3/3]" if not no_diarize else "[2/2]"
+        summary = _summarize(transcript, ollama_model, step)
         minutes_path = output_dir / f"{prefix}_minutes.md"
         minutes_path.write_text(summary, encoding="utf-8")
-        print(f"  → {minutes_path}", file=sys.stderr)
+        typer.echo(f"  → {minutes_path}", err=True)
 
 
 if __name__ == "__main__":
-    main()
+    app()
