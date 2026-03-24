@@ -3,6 +3,7 @@
 import argparse
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -83,7 +84,7 @@ def main():
     parser.add_argument("--whisper-model", default=WHISPER_MODEL, help=f"Whisperモデル (default: {WHISPER_MODEL})")
     parser.add_argument("--ollama-model", default=OLLAMA_MODEL, help=f"Ollamaモデル (default: {OLLAMA_MODEL})")
     parser.add_argument("--transcript-only", action="store_true", help="文字起こしのみ（要約なし）")
-    parser.add_argument("--output", "-o", help="出力ファイルパス（省略時は標準出力）")
+    parser.add_argument("--output-dir", default="output", help="出力ディレクトリ (default: output)")
     args = parser.parse_args()
 
     audio_path = Path(args.audio)
@@ -91,19 +92,21 @@ def main():
         print(f"エラー: ファイルが見つかりません: {audio_path}", file=sys.stderr)
         sys.exit(1)
 
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    prefix = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+
     transcript = transcribe(str(audio_path), args.whisper_model)
 
-    if args.transcript_only:
-        output = transcript
-    else:
-        summary = summarize(transcript, args.ollama_model)
-        output = f"{summary}\n\n---\n\n## 文字起こし全文\n\n{transcript}"
+    transcript_path = output_dir / f"{prefix}_transcript.txt"
+    transcript_path.write_text(transcript, encoding="utf-8")
+    print(f"  → {transcript_path}", file=sys.stderr)
 
-    if args.output:
-        Path(args.output).write_text(output, encoding="utf-8")
-        print(f"出力: {args.output}", file=sys.stderr)
-    else:
-        print(output)
+    if not args.transcript_only:
+        summary = summarize(transcript, args.ollama_model)
+        minutes_path = output_dir / f"{prefix}_minutes.md"
+        minutes_path.write_text(summary, encoding="utf-8")
+        print(f"  → {minutes_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":
