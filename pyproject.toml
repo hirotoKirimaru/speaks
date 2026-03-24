@@ -1,0 +1,10 @@
+[project]
+name = "speaks"
+version = "0.1.0"
+description = "ローカル音声文字起こし + 議事録要約ツール"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "faster-whisper>=1.2.1",
+    "httpx>=0.28.1",
+]
