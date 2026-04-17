@@ -8,16 +8,23 @@ from pathlib import Path
 from typing import Annotated, Optional
 
 import httpx
+import numpy as np
+import torch
+import torchaudio
 import typer
 from faster_whisper import WhisperModel
+from scipy.io import wavfile
 
 app = typer.Typer(help="音声ファイルを文字起こし + 議事録要約")
 
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_MODEL = "llama3.1:8b"
 WHISPER_MODEL = "large-v3"
+TARGET_SR = 16000
 
-SUMMARY_PROMPT = """以下は会議や雑談の文字起こしです。これを議事録形式にまとめてください。
+SUMMARY_PROMPT = """以下は会議の文字起こしです (話者ラベルなし)。
+発言内容から話者を推定し、可能な範囲で発話主を特定しつつ議事録形式にまとめてください。
+話者が不明な場合は「発言者不明」で構いません。
 
 ## 出力フォーマット（必ずこの形式で）
 
@@ -41,6 +48,74 @@ SUMMARY_PROMPT = """以下は会議や雑談の文字起こしです。これを
 
 {transcript}
 """
+
+
+def _preprocess_audio(audio_path: Path, out_dir: Path) -> Path:
+    """16kHz mono + ピーク正規化で前処理した WAV を返す。"""
+    print("[0/N] 前処理中 (16kHz/mono/正規化)...", file=sys.stderr)
+    start = time.time()
+
+    sr, data = wavfile.read(str(audio_path))
+    if data.dtype == np.int16:
+        audio = data.astype(np.float32) / 32768.0
+    elif data.dtype == np.int32:
+        audio = data.astype(np.float32) / 2147483648.0
+    elif data.dtype == np.uint8:
+        audio = (data.astype(np.float32) - 128.0) / 128.0
+    else:
+        audio = data.astype(np.float32)
+
+    if audio.ndim == 2:
+        audio = audio.mean(axis=1)
+
+    wav = torch.from_numpy(audio).unsqueeze(0)
+    if sr != TARGET_SR:
+        wav = torchaudio.transforms.Resample(sr, TARGET_SR)(wav)
+
+    peak = wav.abs().max()
+    if peak > 0:
+        wav = wav * (0.95 / peak)
+
+    out_path = out_dir / f"{audio_path.stem}_16k.wav"
+    wav_int16 = (wav.squeeze(0).numpy() * 32767.0).astype(np.int16)
+    wavfile.write(str(out_path), TARGET_SR, wav_int16)
+
+    elapsed = time.time() - start
+    print(f"    完了 ({elapsed:.1f}秒 → {out_path})", file=sys.stderr)
+    return out_path
+
+
+def _merge_words_by_speaker(
+    segments, speaker_turns: list[tuple[float, float, str]] | None
+) -> str:
+    """Whisperのsegment境界を尊重しつつ、segment内では連続する同一話者の発話をマージする。"""
+    lines: list[str] = []
+    for seg in segments:
+        if speaker_turns is None:
+            lines.append(f"[{seg.start:.1f}s - {seg.end:.1f}s] {seg.text.strip()}")
+            continue
+
+        words = seg.words or []
+        if not words:
+            mid = (seg.start + seg.end) / 2
+            speaker = _find_speaker(mid, speaker_turns)
+            lines.append(f"[{seg.start:.1f}s - {seg.end:.1f}s] {speaker}: {seg.text.strip()}")
+            continue
+
+        groups: list[list] = []  # [[speaker, [word,...], start, end], ...]
+        for w in words:
+            wmid = (w.start + w.end) / 2
+            speaker = _find_speaker(wmid, speaker_turns)
+            if groups and groups[-1][0] == speaker:
+                groups[-1][1].append(w.word)
+                groups[-1][3] = w.end
+            else:
+                groups.append([speaker, [w.word], w.start, w.end])
+
+        for speaker, ws, start, end in groups:
+            lines.append(f"[{start:.1f}s - {end:.1f}s] {speaker}: {''.join(ws).strip()}")
+
+    return "\n".join(lines)
 
 
 def _resolve_hf_token() -> str:
@@ -95,14 +170,27 @@ def _transcribe(
     audio_path: str,
     model_size: str,
     speaker_turns: list[tuple[float, float, str]] | None = None,
+    initial_prompt: str | None = None,
 ) -> str:
-    """faster-whisper で音声を文字起こし"""
+    """faster-whisper で音声を文字起こし (VAD・幻覚抑制・word timestamps 有効)"""
     step = "[2/3]" if speaker_turns is not None else "[1/2]"
     print(f"{step} 文字起こし中... (model: {model_size})", file=sys.stderr)
     start = time.time()
 
     model = WhisperModel(model_size, device="auto", compute_type="auto")
-    segments, info = model.transcribe(audio_path, language="ja", beam_size=5)
+    segments, info = model.transcribe(
+        audio_path,
+        language="ja",
+        beam_size=5,
+        vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 500},
+        no_speech_threshold=0.6,
+        log_prob_threshold=-1.0,
+        compression_ratio_threshold=2.4,
+        condition_on_previous_text=False,
+        word_timestamps=True,
+        initial_prompt=initial_prompt,
+    )
     segments = list(segments)
 
     elapsed = time.time() - start
@@ -111,18 +199,7 @@ def _transcribe(
         file=sys.stderr,
     )
 
-    if speaker_turns is None:
-        lines = []
-        for seg in segments:
-            lines.append(f"[{seg.start:.1f}s - {seg.end:.1f}s] {seg.text}")
-        return "\n".join(lines)
-
-    lines = []
-    for seg in segments:
-        seg_mid = (seg.start + seg.end) / 2
-        speaker = _find_speaker(seg_mid, speaker_turns)
-        lines.append(f"[{seg.start:.1f}s - {seg.end:.1f}s] {speaker}: {seg.text}")
-    return "\n".join(lines)
+    return _merge_words_by_speaker(segments, speaker_turns)
 
 
 def _summarize(transcript: str, model: str, step: str = "[3/3]") -> str:
@@ -154,6 +231,8 @@ def run(
     no_diarize: Annotated[bool, typer.Option("--no-diarize", help="話者分離を無効化")] = False,
     hf_token: Annotated[Optional[str], typer.Option(help="HuggingFaceトークン")] = None,
     output_dir: Annotated[Path, typer.Option(help="出力ディレクトリ")] = Path("output"),
+    initial_prompt: Annotated[Optional[str], typer.Option(help="Whisperへの文脈プロンプト (固有名詞補正)")] = None,
+    skip_preprocess: Annotated[bool, typer.Option("--skip-preprocess", help="前処理 (16kHz化) をスキップ")] = False,
 ):
     """音声ファイルを文字起こしして議事録を生成する。"""
     if not audio.exists():
@@ -174,11 +253,15 @@ def run(
     output_dir.mkdir(parents=True, exist_ok=True)
     prefix = datetime.now().strftime("%Y-%m-%d_%H%M%S")
 
+    processed_audio = audio if skip_preprocess else _preprocess_audio(audio, output_dir)
+
     speaker_turns = None
     if not no_diarize:
-        speaker_turns = _diarize(str(audio), token)
+        speaker_turns = _diarize(str(processed_audio), token)
 
-    transcript = _transcribe(str(audio), whisper_model, speaker_turns)
+    transcript = _transcribe(
+        str(processed_audio), whisper_model, speaker_turns, initial_prompt
+    )
 
     transcript_path = output_dir / f"{prefix}_transcript.txt"
     transcript_path.write_text(transcript, encoding="utf-8")
