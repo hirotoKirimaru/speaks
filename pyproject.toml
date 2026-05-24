@@ -10,8 +10,12 @@ dependencies = [
     "pyannote-audio>=4.0.4",
     "torch>=2.11.0",
     "torchaudio>=2.11.0",
+    "transformers>=4.45.0",
     "typer>=0.24.0",
 ]
+
+[project.optional-dependencies]
+sortformer = ["nemo_toolkit[asr]>=2.0.0"]
 
 [project.scripts]
 speaks = "speaks.cli:app"
@@ -22,3 +26,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["speaks"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"speaks/data/hallucination_phrases.ja.txt" = "speaks/data/hallucination_phrases.ja.txt"
